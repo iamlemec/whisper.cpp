@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 #include <fstream>
+#include <iomanip>
 
 // command-line parameters
 struct whisper_params {
@@ -109,51 +110,39 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "\n");
 }
 
-void blank_line() {
-    printf("\33[2K\r");
-    printf("%s", std::string(100, ' ').c_str());
-    printf("\33[2K\r");
-    fflush(stdout);
-}
-
-void print_timestamp(std::chrono::high_resolution_clock::time_point t_begin, std::chrono::high_resolution_clock::time_point t_end) {
-    std::time_t time_begin = std::chrono::system_clock::to_time_t(t_begin);
-    std::time_t time_end = std::chrono::system_clock::to_time_t(t_end);
-    char timestamp_begin[100];
-    char timestamp_end[100];
-    std::strftime(timestamp_begin, sizeof(timestamp_begin), "%Y-%m-%d %H:%M:%S", std::localtime(&time_begin));
-    std::strftime(timestamp_end, sizeof(timestamp_end), "%Y-%m-%d %H:%M:%S", std::localtime(&time_end));
-    printf("[%s] --> [%s] ", timestamp_begin, timestamp_end);
-    fflush(stdout);
+std::string get_timestamp(std::chrono::high_resolution_clock::time_point t) {
+    std::time_t time = std::chrono::system_clock::to_time_t(t);
+    std::stringstream ss;
+    ss << std::put_time(std::localtime(&time), "%Y-%m-%d %H:%M:%S");
+    return ss.str();
 }
 
 int main(int argc, char ** argv) {
+    // parse command line arguments
     whisper_params params;
-
     if (whisper_params_parse(argc, argv, params) == false) {
         return 1;
     }
 
+    // set default parameters
     params.keep_ms   = std::min(params.keep_ms,   params.step_ms);
     params.length_ms = std::max(params.length_ms, params.step_ms);
+    params.no_timestamps  = true;
+    params.max_tokens     = 0;
 
+    // calculate sample sizes
     const int n_samples_step = (1e-3*params.step_ms  )*WHISPER_SAMPLE_RATE;
     const int n_samples_len  = (1e-3*params.length_ms)*WHISPER_SAMPLE_RATE;
     const int n_samples_keep = (1e-3*params.keep_ms  )*WHISPER_SAMPLE_RATE;
     const int n_samples_30s  = (1e-3*30000.0         )*WHISPER_SAMPLE_RATE;
-    const int n_new_line = std::max(1, params.length_ms / params.step_ms - 1); // number of steps to print new line
-
-    params.no_timestamps  = true;
-    params.max_tokens     = 0;
+    const int n_new_line = std::max(1, params.length_ms / params.step_ms - 1);
 
     // init audio
-
     audio_async audio(params.length_ms);
     if (!audio.init(params.capture_id, WHISPER_SAMPLE_RATE)) {
         fprintf(stderr, "%s: audio.init() failed!\n", __func__);
         return 1;
     }
-
     audio.resume();
 
     // whisper init
@@ -163,18 +152,11 @@ int main(int argc, char ** argv) {
         exit(0);
     }
 
+    // make whisper context
     struct whisper_context_params cparams = whisper_context_default_params();
-
     cparams.use_gpu    = params.use_gpu;
     cparams.flash_attn = params.flash_attn;
-
     struct whisper_context * ctx = whisper_init_from_file_with_params(params.model.c_str(), cparams);
-
-    std::vector<float> pcmf32    (n_samples_30s, 0.0f);
-    std::vector<float> pcmf32_old;
-    std::vector<float> pcmf32_new(n_samples_30s, 0.0f);
-
-    std::vector<whisper_token> prompt_tokens;
 
     // print some info about the processing
     {
@@ -200,9 +182,13 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "\n");
     }
 
-    // state variables
-    int n_iter = 0;
-    bool is_running = true;
+    // audio buffers
+    std::vector<float> pcmf32    (n_samples_30s, 0.0f);
+    std::vector<float> pcmf32_old;
+    std::vector<float> pcmf32_new(n_samples_30s, 0.0f);
+
+    // text output
+    std::vector<whisper_token> prompt_tokens;
     std::string last_text;
 
     // output file
@@ -219,9 +205,13 @@ int main(int argc, char ** argv) {
     printf("[Start speaking]\n");
     fflush(stdout);
 
+    // state variables
+    int n_iter = 0;
+    bool is_running = true;
+
     // main audio loop
     while (is_running) {
-        // handle Ctrl + C
+        // handle ctrl + c
         is_running = sdl_poll_events();
         if (!is_running) {
             break;
@@ -261,8 +251,9 @@ int main(int argc, char ** argv) {
             pcmf32_old = pcmf32;
         }
 
-        // run the inference
-        {
+        // use VAD to determine if the audio is speech
+        last_text = "";
+        if (::vad_simple(pcmf32_new, WHISPER_SAMPLE_RATE, 1000, params.vad_thold, params.freq_thold, false)) {
             whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
             wparams.print_progress   = false;
             wparams.print_special    = params.print_special;
@@ -285,60 +276,67 @@ int main(int argc, char ** argv) {
                 return 6;
             }
 
-            // print result
-            {
-                // print timestamp
-                blank_line();
-                const int t_diff = (int)round(pcmf32.size()*1000.0/WHISPER_SAMPLE_RATE);
-                const auto t_now  = std::chrono::high_resolution_clock::now();
-                const auto t_then = t_now - std::chrono::milliseconds(t_diff);
-                print_timestamp(t_then, t_now);
+            // calculate timestamp
+            const int t_diff = (int)round(pcmf32.size()*1000.0/WHISPER_SAMPLE_RATE);
+            const auto t_end  = std::chrono::high_resolution_clock::now();
+            const auto t_beg = t_end - std::chrono::milliseconds(t_diff);
+            std::string timestamp_beg = get_timestamp(t_beg);
+            std::string timestamp_end = get_timestamp(t_end);
+
+            // clear line
+            printf("\33[2K\r");
+            printf("%s", std::string(100, ' ').c_str());
+            printf("\33[2K\r");
+            fflush(stdout);
+
+            // print timestamp
+            printf("[%s --> %s] ", timestamp_beg.c_str(), timestamp_end.c_str());
+            fflush(stdout);
+
+            // print text
+            const int n_segments = whisper_full_n_segments(ctx);
+            for (int i = 0; i < n_segments; ++i) {
+                // store new text
+                const char * text = whisper_full_get_segment_text(ctx, i);
+                last_text += text;
 
                 // print text
-                last_text = "";
-                const int n_segments = whisper_full_n_segments(ctx);
-                for (int i = 0; i < n_segments; ++i) {
-                    const char * text = whisper_full_get_segment_text(ctx, i);
-                    last_text += text;
+                printf("%s", text);
+                fflush(stdout);
 
-                    printf("%s", text);
-                    fflush(stdout);
-
-                    if (params.fname_out.length() > 0) {
-                        fout << text;
-                    }
-                }
-
-                // print new line if file
+                // write to file
                 if (params.fname_out.length() > 0) {
-                    fout << std::endl;
+                    fout << text;
                 }
             }
 
-            // update iteration count
-            ++n_iter;
+            // print new line if file
+            if (params.fname_out.length() > 0) {
+                fout << std::endl;
+            }
+        }
 
-            // print new line if necessary
-            if (n_iter % n_new_line == 0) {
-                // keep part of the audio for next iteration to try to mitigate word boundary issues
-                pcmf32_old = std::vector<float>(pcmf32.end() - n_samples_keep, pcmf32.end());
+        // print new line if necessary
+        ++n_iter;
+        if (n_iter % n_new_line == 0) {
+            // keep part of the audio for next iteration to try to mitigate word boundary issues
+            pcmf32_old = std::vector<float>(pcmf32.end() - n_samples_keep, pcmf32.end());
 
-                // Add tokens of the last full length segment as the prompt
-                if (!params.no_context) {
-                    prompt_tokens.clear();
-                    const int n_segments = whisper_full_n_segments(ctx);
-                    for (int i = 0; i < n_segments; ++i) {
-                        const int token_count = whisper_full_n_tokens(ctx, i);
-                        for (int j = 0; j < token_count; ++j) {
-                            prompt_tokens.push_back(whisper_full_get_token_id(ctx, i, j));
-                        }
+            // Add tokens of the last full length segment as the prompt
+            if (!params.no_context) {
+                prompt_tokens.clear();
+                const int n_segments = whisper_full_n_segments(ctx);
+                for (int i = 0; i < n_segments; ++i) {
+                    const int token_count = whisper_full_n_tokens(ctx, i);
+                    for (int j = 0; j < token_count; ++j) {
+                        prompt_tokens.push_back(whisper_full_get_token_id(ctx, i, j));
                     }
                 }
+            }
 
-                // print new line (if any tokens were added)
-                if (last_text.size() > 0 && last_text != "[BLANK_AUDIO]") {
-                    printf("\n");
-                }
+            // print new line (if any tokens were added)
+            if (last_text.size() > 0 && last_text != "[BLANK_AUDIO]") {
+                printf("\n");
             }
         }
     }
