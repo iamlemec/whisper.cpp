@@ -13,7 +13,6 @@
 #include <vector>
 #include <fstream>
 
-
 // command-line parameters
 struct whisper_params {
     int32_t n_threads  = std::min(4, (int32_t) std::thread::hardware_concurrency());
@@ -33,7 +32,7 @@ struct whisper_params {
     bool no_context    = true;
     bool no_timestamps = false;
     bool tinydiarize   = false;
-    bool save_audio    = false; // save audio to wav file
+    bool save_audio    = false;
     bool use_gpu       = true;
     bool flash_attn    = false;
 
@@ -69,7 +68,6 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-m"    || arg == "--model")         { params.model         = argv[++i]; }
         else if (arg == "-f"    || arg == "--file")          { params.fname_out     = argv[++i]; }
         else if (arg == "-tdrz" || arg == "--tinydiarize")   { params.tinydiarize   = true; }
-        else if (arg == "-sa"   || arg == "--save-audio")    { params.save_audio    = true; }
         else if (arg == "-ng"   || arg == "--no-gpu")        { params.use_gpu       = false; }
         else if (arg == "-fa"   || arg == "--flash-attn")    { params.flash_attn    = true; }
 
@@ -106,7 +104,6 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -m FNAME, --model FNAME   [%-7s] model path\n",                                     params.model.c_str());
     fprintf(stderr, "  -f FNAME, --file FNAME    [%-7s] text output file name\n",                          params.fname_out.c_str());
     fprintf(stderr, "  -tdrz,    --tinydiarize   [%-7s] enable tinydiarize (requires a tdrz model)\n",     params.tinydiarize ? "true" : "false");
-    fprintf(stderr, "  -sa,      --save-audio    [%-7s] save the recorded audio to a file\n",              params.save_audio ? "true" : "false");
     fprintf(stderr, "  -ng,      --no-gpu        [%-7s] disable GPU inference\n",                          params.use_gpu ? "false" : "true");
     fprintf(stderr, "  -fa,      --flash-attn    [%-7s] flash attention during inference\n",               params.flash_attn ? "true" : "false");
     fprintf(stderr, "\n");
@@ -144,13 +141,9 @@ int main(int argc, char ** argv) {
     const int n_samples_len  = (1e-3*params.length_ms)*WHISPER_SAMPLE_RATE;
     const int n_samples_keep = (1e-3*params.keep_ms  )*WHISPER_SAMPLE_RATE;
     const int n_samples_30s  = (1e-3*30000.0         )*WHISPER_SAMPLE_RATE;
+    const int n_new_line = std::max(1, params.length_ms / params.step_ms - 1); // number of steps to print new line
 
-    const bool use_vad = n_samples_step <= 0; // sliding window mode uses VAD
-
-    const int n_new_line = !use_vad ? std::max(1, params.length_ms / params.step_ms - 1) : 1; // number of steps to print new line
-
-    params.no_timestamps  = !use_vad;
-    params.no_context    |= use_vad;
+    params.no_timestamps  = true;
     params.max_tokens     = 0;
 
     // init audio
@@ -203,20 +196,16 @@ int main(int argc, char ** argv) {
                 params.language.c_str(),
                 params.translate ? "translate" : "transcribe",
                 params.no_timestamps ? 0 : 1);
-
-        if (!use_vad) {
-            fprintf(stderr, "%s: n_new_line = %d, no_context = %d\n", __func__, n_new_line, params.no_context);
-        } else {
-            fprintf(stderr, "%s: using VAD, will transcribe on speech activity\n", __func__);
-        }
-
+        fprintf(stderr, "%s: n_new_line = %d, no_context = %d\n", __func__, n_new_line, params.no_context);
         fprintf(stderr, "\n");
     }
 
+    // state variables
     int n_iter = 0;
-
     bool is_running = true;
+    std::string last_text;
 
+    // output file
     std::ofstream fout;
     if (params.fname_out.length() > 0) {
         fout.open(params.fname_out);
@@ -226,42 +215,20 @@ int main(int argc, char ** argv) {
         }
     }
 
-    wav_writer wavWriter;
-    // save wav file
-    if (params.save_audio) {
-        // Get current date/time for filename
-        time_t now = time(0);
-        char buffer[80];
-        strftime(buffer, sizeof(buffer), "%Y%m%d%H%M%S", localtime(&now));
-        std::string filename = std::string(buffer) + ".wav";
-
-        wavWriter.open(filename, WHISPER_SAMPLE_RATE, 16, 1);
-    }
+    // print start message
     printf("[Start speaking]\n");
     fflush(stdout);
 
-    auto t_last  = std::chrono::high_resolution_clock::now();
-    const auto t_start = t_last;
-
-    std::string last_text;
-
     // main audio loop
     while (is_running) {
-        if (params.save_audio) {
-            wavWriter.write(pcmf32_new.data(), pcmf32_new.size());
-        }
         // handle Ctrl + C
         is_running = sdl_poll_events();
-
         if (!is_running) {
             break;
         }
 
         // process new audio
-
-        if (!use_vad) {
-            t_last = std::chrono::high_resolution_clock::now();
-
+        {
             while (true) {
                 audio.get(params.step_ms, pcmf32_new);
 
@@ -279,141 +246,80 @@ int main(int argc, char ** argv) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
 
-            const int n_samples_new = pcmf32_new.size();
-
             // take up to params.length_ms audio from previous iteration
+            const int n_samples_new = pcmf32_new.size();
             const int n_samples_take = std::min((int) pcmf32_old.size(), std::max(0, n_samples_keep + n_samples_len - n_samples_new));
 
-            //printf("processing: take = %d, new = %d, old = %d\n", n_samples_take, n_samples_new, (int) pcmf32_old.size());
-
+            // copy old audio to new audio
             pcmf32.resize(n_samples_new + n_samples_take);
-
             for (int i = 0; i < n_samples_take; i++) {
                 pcmf32[i] = pcmf32_old[pcmf32_old.size() - n_samples_take + i];
             }
 
+            // copy to new audio
             memcpy(pcmf32.data() + n_samples_take, pcmf32_new.data(), n_samples_new*sizeof(float));
-
             pcmf32_old = pcmf32;
-        } else {
-            const auto t_now  = std::chrono::high_resolution_clock::now();
-            const auto t_diff = std::chrono::duration_cast<std::chrono::milliseconds>(t_now - t_last).count();
-
-            if (t_diff < 2000) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-                continue;
-            }
-
-            audio.get(2000, pcmf32_new);
-
-            if (::vad_simple(pcmf32_new, WHISPER_SAMPLE_RATE, 1000, params.vad_thold, params.freq_thold, false)) {
-                audio.get(params.length_ms, pcmf32);
-            } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-                continue;
-            }
-
-            t_last = t_now;
         }
 
         // run the inference
         {
             whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-
             wparams.print_progress   = false;
             wparams.print_special    = params.print_special;
             wparams.print_realtime   = false;
             wparams.print_timestamps = !params.no_timestamps;
             wparams.translate        = params.translate;
-            wparams.single_segment   = !use_vad;
+            wparams.single_segment   = true;
             wparams.max_tokens       = params.max_tokens;
             wparams.language         = params.language.c_str();
             wparams.n_threads        = params.n_threads;
-
             wparams.audio_ctx        = params.audio_ctx;
-
-            wparams.tdrz_enable      = params.tinydiarize; // [TDRZ]
-
-            // disable temperature fallback
-            //wparams.temperature_inc  = -1.0f;
+            wparams.tdrz_enable      = params.tinydiarize;
             wparams.temperature_inc  = params.no_fallback ? 0.0f : wparams.temperature_inc;
-
             wparams.prompt_tokens    = params.no_context ? nullptr : prompt_tokens.data();
             wparams.prompt_n_tokens  = params.no_context ? 0       : prompt_tokens.size();
 
+            // execute inference
             if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0) {
                 fprintf(stderr, "%s: failed to process audio\n", argv[0]);
                 return 6;
             }
 
-            // print result;
+            // print result
             {
-                if (!use_vad) {
-                    // print timestamp
-                    blank_line();
-                    const int t_diff = (int)round(pcmf32.size()*1000.0/WHISPER_SAMPLE_RATE);
-                    const auto t_now  = std::chrono::high_resolution_clock::now();
-                    const auto t_then = t_now - std::chrono::milliseconds(t_diff);
-                    print_timestamp(t_then, t_now);
-                } else {
-                    const int64_t t1 = (t_last - t_start).count()/1000000;
-                    const int64_t t0 = std::max(0.0, t1 - pcmf32.size()*1000.0/WHISPER_SAMPLE_RATE);
+                // print timestamp
+                blank_line();
+                const int t_diff = (int)round(pcmf32.size()*1000.0/WHISPER_SAMPLE_RATE);
+                const auto t_now  = std::chrono::high_resolution_clock::now();
+                const auto t_then = t_now - std::chrono::milliseconds(t_diff);
+                print_timestamp(t_then, t_now);
 
-                    printf("\n");
-                    printf("### Transcription %d START | t0 = %d ms | t1 = %d ms\n", n_iter, (int) t0, (int) t1);
-                    printf("\n");
-                }
-
+                // print text
                 last_text = "";
                 const int n_segments = whisper_full_n_segments(ctx);
                 for (int i = 0; i < n_segments; ++i) {
                     const char * text = whisper_full_get_segment_text(ctx, i);
+                    last_text += text;
 
-                    if (params.no_timestamps) {
-                        printf("%s", text);
-                        fflush(stdout);
+                    printf("%s", text);
+                    fflush(stdout);
 
-                        last_text += text;
-
-                        if (params.fname_out.length() > 0) {
-                            fout << text;
-                        }
-                    } else {
-                        const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
-                        const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
-
-                        std::string output = "[" + to_timestamp(t0, false) + " --> " + to_timestamp(t1, false) + "]  " + text;
-
-                        if (whisper_full_get_segment_speaker_turn_next(ctx, i)) {
-                            output += " [SPEAKER_TURN]";
-                        }
-
-                        output += "\n";
-
-                        printf("%s", output.c_str());
-                        fflush(stdout);
-
-                        if (params.fname_out.length() > 0) {
-                            fout << output;
-                        }
+                    if (params.fname_out.length() > 0) {
+                        fout << text;
                     }
                 }
 
+                // print new line if file
                 if (params.fname_out.length() > 0) {
                     fout << std::endl;
                 }
-
-                if (use_vad) {
-                    printf("\n");
-                    printf("### Transcription %d END\n", n_iter);
-                }
             }
 
+            // update iteration count
             ++n_iter;
 
-            if (!use_vad && (n_iter % n_new_line) == 0) {
+            // print new line if necessary
+            if (n_iter % n_new_line == 0) {
                 // keep part of the audio for next iteration to try to mitigate word boundary issues
                 pcmf32_old = std::vector<float>(pcmf32.end() - n_samples_keep, pcmf32.end());
 
@@ -434,14 +340,12 @@ int main(int argc, char ** argv) {
                     printf("\n");
                 }
             }
-            fflush(stdout);
         }
     }
 
+    // cleanup
     audio.pause();
-
     whisper_print_timings(ctx);
     whisper_free(ctx);
-
     return 0;
 }
