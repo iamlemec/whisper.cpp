@@ -236,7 +236,7 @@ int main(int argc, char ** argv) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
 
-            // take up to params.length_ms audio from previous iteration
+            // take up to params.keep_ms audio from previous iteration
             const int n_samples_new = pcmf32_new.size();
             const int n_samples_take = std::min((int) pcmf32_old.size(), std::max(0, n_samples_keep + n_samples_len - n_samples_new));
 
